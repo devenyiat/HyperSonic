@@ -1,4 +1,4 @@
-﻿﻿﻿using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -164,15 +164,46 @@ namespace HyperSonic
     }
 
     [Serializable]
+    public struct Step
+    {
+        public int FieldId { get; }
+        public bool PlaceBomb { get; }
+        public Step(int fieldId, bool placeBomb)
+        {
+            FieldId = fieldId;
+            PlaceBomb = placeBomb;
+        }
+        public override string ToString()
+        {
+            var t = PlaceBomb ? "+" : "";
+            return $"{FieldId}{t}";
+        }
+    }
+
+    [Serializable]
     public class Route
     {
-        public string Id { get; }
-        public int Steps { get; }
+        public List<Step> Steps { get; }
+        public decimal Fitness { get; private set; }
 
-        public Route(string id, int steps)
+        public Route(Step lastStep)
         {
-            Id = id;
-            Steps = steps;
+            Steps = new List<Step>() { lastStep };
+        }
+
+        public void PrependStep(Step step)
+        {
+            Steps.Insert(0, step);
+        }
+
+        public void AdjustFitness(decimal fitness)
+        {
+            Fitness += fitness;
+        }
+
+        public override string ToString()
+        {
+            return string.Join("->", Steps.Select(s => s.ToString()));
         }
     }
 
@@ -223,7 +254,8 @@ namespace HyperSonic
         }
 
         public abstract bool IsAccessible(int when);
-        public abstract void SetExplodeAt(int direction, int range, int when);
+        public abstract decimal SetExplodeAt(int direction, int range, int when, int bombOwner);
+        public abstract char GetIcon();
 
         // public void AddNeighborFunc(Func<int, Field> func)
         // {
@@ -260,9 +292,13 @@ namespace HyperSonic
         public Wall(Position position) : base(position) { }
 
         public override bool IsAccessible(int when) => false;
-        public override void SetExplodeAt(int direction, int range, int when)
+        public override decimal SetExplodeAt(int direction, int range, int when, int bombOwner)
         {
-            return;
+            return 0m;
+        }
+        public override char GetIcon()
+        {
+            return 'x';
         }
     }
 
@@ -323,7 +359,7 @@ namespace HyperSonic
         //     }
         // }
 
-        public override void SetExplodeAt(int direction, int range, int when)
+        public override decimal SetExplodeAt(int direction, int range, int when, int bombOwner)
         {
             if (ExplodeAt == null)
             {
@@ -335,40 +371,67 @@ namespace HyperSonic
             }
             if (range == 0)
             {
-                return;
+                return 0m;
             }
             if (HasBox(when))
             {
                 Box.ExistsUntil = when;
+                Box.DestroyedBy = bombOwner;
                 Item = new Item(Box.Content, when + 1);
-                return;
+                return 1 / when;
             }
             if (HasItem(when))
             {
                 Item.ExistsUntil = when;
-                return;
+                return 0m;
             }
+            var fitness = 0m;
             if (HasBomb(when) && !Bomb.HasExploded)
             {
                 Bomb.HasExploded = true;
-                Bomb.ExistsUntil = when;
                 for (int i = 0; i < 4; i++)
                 {
                     if (Neighbors[i] == null)
                     {
                         continue;
                     }
-                    Neighbors[i].SetExplodeAt(i, Bomb.ExplosionRange, when);
+                    fitness += Neighbors[i].SetExplodeAt(i, Bomb.ExplosionRange, when, Bomb.Owner);
                 }
             }
             else
             {
                 if (Neighbors[direction] == null)
                 {
-                    return;
+                    return 0m;
                 }
-                Neighbors[direction].SetExplodeAt(direction, range - 1, when);
+                fitness += Neighbors[direction].SetExplodeAt(direction, range - 1, when, bombOwner);
             }
+            return fitness;
+        }
+
+        public override char GetIcon()
+        {
+            if (HasPlayer(0))
+            {
+                if (HasBomb(0))
+                {
+                    return 'P';
+                }
+                return 'p';
+            }
+            if (HasBomb(0))
+            {
+                return 'b';
+            }
+            if (HasItem(0))
+            {
+                return 'i';
+            }
+            if (HasBox(0))
+            {
+                return 'o';
+            }
+            return ExplodeAt?.FirstOrDefault().ToString().ToCharArray()[0] ?? '-';
         }
     }
 
@@ -393,6 +456,7 @@ namespace HyperSonic
     public class Box : Obstacle
     {
         public int Content { get; }
+        public int DestroyedBy { get; set; }
         public Box(Position position, int content)
         {
             Content = content;
@@ -432,6 +496,7 @@ namespace HyperSonic
             ExplosionRange = entity.Params[1];
             Position = entity.Position;
             ExistsFrom = 0;
+            ExistsUntil = RoundsLeft;
         }
 
         public Bomb(int owner, int roundsLeft, int range, Position position, int existsFrom)
@@ -441,6 +506,7 @@ namespace HyperSonic
             ExplosionRange = range;
             Position = position;
             ExistsFrom = existsFrom;
+            ExistsUntil = RoundsLeft;
         }
     }
 
@@ -501,6 +567,7 @@ namespace HyperSonic
     {
         public Player Me { get; private set; }
         public List<Player> Others { get; }
+        public decimal Fitness { get; private set; }
         private Dictionary<Position, Field> fieldsByPosition;
         private Dictionary<int, Field> fieldsById;
         private List<Field> fields;
@@ -576,6 +643,8 @@ namespace HyperSonic
         public void CalculateExplosionTimes()
         {
             fields.ForEach(field => field.ExplodeAt = null);
+            bombs.ForEach(b => b.HasExploded = false);
+            var fitness = 0m;
             foreach (var bomb in bombs)
             {
                 if (bomb.HasExploded)
@@ -585,9 +654,10 @@ namespace HyperSonic
                 bomb.HasExploded = true;
                 for (int i = 0; i < 4; i++)
                 {
-                    fieldsByPosition[bomb.Position].SetExplodeAt(i, bomb.ExplosionRange, bomb.RoundsLeft);
+                    fitness += fieldsByPosition[bomb.Position].SetExplodeAt(i, bomb.ExplosionRange, bomb.RoundsLeft, bomb.Owner);
                 }
             }
+            Fitness = fitness;
         }
 
         public void SimulateRound(int round)
@@ -599,13 +669,36 @@ namespace HyperSonic
             ConnectFields();
         }
 
-        public List<List<int>> WaysOutFrom(Position position, int routeLength, int distance, int bombsLeft, bool searchUntilFirst)
+        public List<Route> WaysOutFrom(Position position, int routeLength, int distance, int bombsLeft, bool searchUntilFirst)
         {
-            var currentField = fieldsByPosition[position];
+            var result = new List<Route>();
+            var currentField = (Floor)fieldsByPosition[position];
+            if (bombsLeft > 0 && !currentField.HasBomb(distance) && distance <= routeLength)
+            {
+                // with bomb
+                var mapWithBomb = this.Clone();
+                mapWithBomb.AddBomb(new Bomb(Me.Id, distance + 8, Me.ExplosionRange, position, distance));
+                mapWithBomb.CalculateExplosionTimes();
+                var correctedRouteLength = bombsLeft == 1 ? distance + 8 : routeLength;
+                var correctedSearchUntilFirst = bombsLeft == 1 ? true : searchUntilFirst;
+                var waysWithBombHere = mapWithBomb.WaysOutFromPrivate(
+                        position, correctedRouteLength, distance, bombsLeft - 1, correctedSearchUntilFirst, true);
+                result.AddRange(waysWithBombHere);
+            }
+
+            result.AddRange(this.WaysOutFromPrivate(position, routeLength, distance, bombsLeft, searchUntilFirst, false));
+            return result;
+        }
+
+        private List<Route> WaysOutFromPrivate(Position position, int routeLength, int distance, int bombsLeft, bool searchUntilFirst, bool bombPlaced)
+        {
+            var currentField = (Floor)fieldsByPosition[position];
             if (distance == routeLength)
             {
-                var result = new List<List<int>>();
-                result.Add(new List<int>() { fieldsByPosition[position].FieldId });
+                var result = new List<Route>();
+                var route = new Route(new Step(fieldsByPosition[position].FieldId, bombPlaced));
+                route.AdjustFitness(Fitness);
+                result.Add(route);
                 return result;
             }
 
@@ -620,36 +713,45 @@ namespace HyperSonic
                     .Where(nf => nf.ExplodeAt == null || !nf.ExplodeAt.Contains(distance + 1))
                     .ToList();
 
-            List<List<int>> routes = 
-            //     new List<List<int>>();
-            // foreach(var nf in safeNextFields) {
-            //     var listFromHere = WaysOutFrom(nf.Position, routeLength, distance + 1, bombsLeft, searchUntilFirst);
-            //     if (listFromHere != null) {
-            //         if (searchUntilFirst) {
-            //             return listFromHere;
-            //         }
-            //         routes.Add(listFromHere.SelectMany(r => r).ToList());
-            //     }
-            // }
-                
-                safeNextFields
-                    .Select(nf => WaysOutFrom(nf.Position, routeLength, distance + 1, bombsLeft, searchUntilFirst))
-                    .Where(result => result != null)
-                    .SelectMany(result => result)
-                    .ToList();
-
-            if (routes.Any())
+            List<Route> routes =
+                new List<Route>();
+            foreach (var nf in safeNextFields)
             {
-                if (distance != 0)
+                var listFromHere = WaysOutFrom(nf.Position, routeLength, distance + 1, bombsLeft, searchUntilFirst);
+                routes.AddRange(listFromHere);
+                if (searchUntilFirst && listFromHere.Any())
                 {
-                    routes.ForEach(r => r.Insert(0, currentField.FieldId));
+                    break;
                 }
-                return routes;
             }
-            else
+
+            // safeNextFields
+            //     .Select(nf => WaysOutFrom(nf.Position, routeLength, distance + 1, bombsLeft, searchUntilFirst))
+            //     .Where(result => result != null)
+            //     .SelectMany(result => result)
+            //     .ToList();
+
+            // if (routes.Any())
+            // {
+            if (distance != 0)
             {
-                return null;
+                routes.ForEach(r => r.PrependStep(new Step(currentField.FieldId, bombPlaced)));
             }
+            if (currentField.HasItem(distance))
+            {
+                routes.ForEach(r => r.AdjustFitness(0.5m / distance));
+            }
+            return routes;
+            // }
+            // else
+            // {
+            //     return null;
+            // }
+        }
+
+        public Field GetField(int id)
+        {
+            return fieldsById[id];
         }
 
         public List<string> SafeRoutes()
@@ -660,7 +762,7 @@ namespace HyperSonic
 
         public void PrintExplosionMap()
         {
-            var explosionMap = string.Join(" ", fields.Select(f => f.ExplodeAt?.FirstOrDefault().ToString() ?? (f is Wall ? "x" : "-")));
+            var explosionMap = string.Join(" ", fields.Select(f => f.GetIcon()));
             for (int i = 0; i < 11; i++)
             {
                 Console.Error.WriteLine(explosionMap.Substring(i * 26, Math.Min(26, explosionMap.Length - i * 26)));
@@ -688,9 +790,24 @@ namespace HyperSonic
         public string GetNextAction()
         {
             var startingState = GetStartState();
-            var ways = startingState.WaysOutFrom(Map.Me.Position, 8, 0, Map.Me.RemainingBombs, false);
+            var now = DateTime.Now;
+            var wayToGo = startingState.WaysOutFrom(Map.Me.Position, 4, 0, Map.Me.RemainingBombs, false).OrderByDescending(w => w.Fitness).FirstOrDefault();
 
-            return "MOVE 6 5";
+            if (wayToGo == null)
+            {
+                throw new Exception();
+            }
+            string action;
+            if (wayToGo.Steps[0].PlaceBomb)
+            {
+                action = "BOMB";
+            }
+            else
+            {
+                action = "MOVE";
+            }
+            var nextField = Map.GetField(wayToGo.Steps[0].FieldId);
+            return $"{action} {nextField.Position.X} {nextField.Position.Y}";
         }
 
         private Map GetStartState()
@@ -703,7 +820,7 @@ namespace HyperSonic
                 var newBomb = new Bomb(other.Id, 8, other.ExplosionRange, other.Position, 0);
                 mapWithNewBomb.AddBomb(newBomb);
                 mapWithNewBomb.CalculateExplosionTimes();
-                var isOk = mapWithNewBomb.WaysOutFrom(other.Position, 8, 0, 0, true) != null;
+                var isOk = mapWithNewBomb.WaysOutFrom(other.Position, 8, 0, 0, true).Any();
                 if (isOk)
                 {
                     newBombs.Add(newBomb);
@@ -740,7 +857,11 @@ namespace HyperSonic
                 input.ReadRound();
                 strategy.Map = input.GetMap();
 
+                Console.WriteLine(DateTime.Now);
+
                 var nextAction = strategy.GetNextAction();
+
+                Console.WriteLine(DateTime.Now);
 
                 Console.WriteLine(nextAction);
             }
